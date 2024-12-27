@@ -36,10 +36,14 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         # attention (materializes the large (T,T) matrix with all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, hs)
+
+        #att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        #att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        #att = F.softmax(att, dim=-1)
+        #y = att @ v # (B, nh, T, hs)
+        
+        y = F.scaled_dot_product_attention(q,k,v,is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -223,11 +227,14 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
 
-trainloader = DataLoaderLite(B=8, T=1024)
+trainloader = DataLoaderLite(B=32, T=1024) # want to max out batch size based on the GPU 
+
+torch.set_float32_matmul_precision('high')
 
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50384))
 model.to(device)
+model = torch.compile(model)
 
 
 # optimize!
@@ -237,13 +244,15 @@ for i in range(50):
     x,y = trainloader.next_batch()
     x,y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1-t0)*1000
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms")
+    tokens_per_sec = (trainloader.B * trainloader.T)/(t1-t0)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms , tok/sec: {tokens_per_sec:.2f}")
 
 
 
