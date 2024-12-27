@@ -254,7 +254,20 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
 
-trainloader = DataLoaderLite(B=32, T=1024) # want to max out batch size based on the GPU 
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+B = 32 # micro batch size
+T = 1024 # sequence length
+assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"real batch size: {total_batch_size//T} sequences")
+print(f"number of gradient accumulation steps: {grad_accum_steps}")
+
+
+trainloader = DataLoaderLite(B=B, T=T) # want to max out batch size based on the GPU 
 
 torch.set_float32_matmul_precision('high')
 
@@ -291,12 +304,19 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate = 6e-4, d
 
 for step in range(max_steps):
     t0 = time.time()
-    x,y = trainloader.next_batch()
-    x,y = x.to(device), y.to(device)
+    
+    loss_acum = 0
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    for micro_step in range(grad_accum_steps):
+        x,y = trainloader.next_batch()
+        x,y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_acum += loss.detach()
+        loss.backward()
+
+
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
     # determine and step the learning rate
@@ -308,8 +328,8 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1-t0)*1000
-    tokens_per_sec = (trainloader.B * trainloader.T)/(t1-t0)
-    print(f"step {step} | lr: {lr:.3f} | loss: {loss:.4f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    tokens_per_sec = (trainloader.B * trainloader.T * grad_accum_steps)/(t1-t0)
+    print(f"step {step} | lr: {lr:.4e} | loss: {loss_acum.item():.6f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 
 
